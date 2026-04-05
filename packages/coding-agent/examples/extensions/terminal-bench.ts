@@ -4,23 +4,25 @@
  * Optimizes pi for Terminal-Bench 2.0 benchmark performance by porting
  * key strategies from the Meta-Harness agent:
  *
- * 1. **Environment Bootstrapping**: Gathers a sandbox snapshot (pwd, files,
+ * 1. **Environment Bootstrapping**: Gathers a sandbox snapshot (files,
  *    languages, package managers, memory) before the first LLM call and
  *    injects it into the system prompt. Saves 2-5 early exploration turns.
  *
- * 2. **Completion Verification**: Intercepts "I'm done" signals and forces
- *    a self-verification checklist before the agent can finish, reducing
- *    false completions.
+ * 2. **Completion Verification**: When the agent signals it is done, injects
+ *    a self-verification checklist as a follow-up to reduce false completions.
  *
  * 3. **Prompt Optimizations**: Appends Terminal-Bench-specific instructions
  *    to the system prompt (no human help, programmatic multimedia handling,
  *    minimal state changes, cleanup).
  *
+ * The extension is gated behind the --terminal-bench flag and does nothing
+ * unless that flag is provided. This avoids side effects during normal usage.
+ *
  * Usage:
- *   pi -e ./terminal-bench.ts
+ *   pi -e ./terminal-bench.ts --terminal-bench
  *
  * Works best with:
- *   pi -e ./terminal-bench.ts --thinking high
+ *   pi -e ./terminal-bench.ts --terminal-bench --thinking high
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -52,12 +54,13 @@ const TERMINAL_BENCH_GUIDELINES = `
 
 const COMPLETION_CHECKLIST = (taskHint: string, terminalState: string) =>
 	`
-You indicated the task is complete. Before confirming, review this checklist:
+VERIFICATION REQUIRED: You signaled that you are finished. Before moving on,
+review this checklist carefully.
 
-Original task (if available):
+Original task:
 ${taskHint}
 
-Current terminal state (last output):
+Last terminal output:
 ${terminalState}
 
 Checklist — mark each as DONE or TODO:
@@ -71,17 +74,18 @@ Checklist — mark each as DONE or TODO:
   - A QA engineer? [TODO/DONE]
   - The user who requested this task? [TODO/DONE]
 
-If everything is DONE, proceed with your work. If any item is TODO, fix it
-first and then continue.
+If everything is DONE, proceed. If any item is TODO, fix it first.
 `.trim();
 
 // ---------------------------------------------------------------------------
 // Environment bootstrapping
 // ---------------------------------------------------------------------------
 
+// Uses semicolons so a failing command does not abort subsequent sections.
+// Each section marker is unconditional; the actual probes use || fallbacks.
 const BOOTSTRAP_COMMAND = [
-	"echo '@@PWD@@' && pwd",
-	"echo '@@LS@@' && ls -la 2>/dev/null",
+	"echo '@@PWD@@'; pwd",
+	"echo '@@LS@@'; ls -la 2>/dev/null || true",
 	"echo '@@LANG@@'",
 	"(python3 --version 2>&1 || echo 'python3: not found')",
 	"(gcc --version 2>&1 | head -1 || echo 'gcc: not found')",
@@ -96,8 +100,8 @@ const BOOTSTRAP_COMMAND = [
 	"(apt-get --version 2>&1 | head -1 || echo 'apt-get: not found')",
 	"(npm --version 2>&1 || echo 'npm: not found')",
 	"(cargo --version 2>&1 || echo 'cargo: not found')",
-	"echo '@@MEM@@' && free -h 2>/dev/null | head -2 || true",
-].join(" && ");
+	"echo '@@MEM@@'; free -h 2>/dev/null | head -2 || true",
+].join("; ");
 
 interface BootstrapSections {
 	[key: string]: string;
@@ -128,9 +132,8 @@ function parseBootstrapOutput(stdout: string): BootstrapSections {
 function formatSnapshot(sections: BootstrapSections): string {
 	const parts: string[] = [];
 
-	if (sections.PWD) {
-		parts.push(`Working directory: ${sections.PWD.trim()}`);
-	}
+	// Intentionally skip PWD — pi's system prompt already includes
+	// "Current working directory: ..." so repeating it is redundant.
 
 	if (sections.LS) {
 		const lsLines = sections.LS.trim().split("\n");
@@ -138,9 +141,7 @@ function formatSnapshot(sections: BootstrapSections): string {
 			parts.push("Directory contents: (empty)");
 		} else if (lsLines.length > 30) {
 			parts.push(
-				`Directory contents (${lsLines.length} entries):\n` +
-					lsLines.slice(0, 25).join("\n") +
-					`\n... (${lsLines.length - 25} more files)`,
+				`Directory contents (${lsLines.length} entries):\n${lsLines.slice(0, 25).join("\n")}\n... (${lsLines.length - 25} more files)`,
 			);
 		} else {
 			parts.push(`Directory contents:\n${sections.LS.trim()}`);
@@ -151,14 +152,18 @@ function formatSnapshot(sections: BootstrapSections): string {
 		const langLines = sections.LANG.trim()
 			.split("\n")
 			.filter((l) => l.trim());
-		parts.push(`Available languages/tools: ${langLines.join("; ")}`);
+		if (langLines.length > 0) {
+			parts.push(`Available languages/tools: ${langLines.join("; ")}`);
+		}
 	}
 
 	if (sections.PKG) {
 		const pkgLines = sections.PKG.trim()
 			.split("\n")
 			.filter((l) => l.trim());
-		parts.push(`Package managers: ${pkgLines.join("; ")}`);
+		if (pkgLines.length > 0) {
+			parts.push(`Package managers: ${pkgLines.join("; ")}`);
+		}
 	}
 
 	if (sections.MEM) {
@@ -176,16 +181,85 @@ function formatSnapshot(sections: BootstrapSections): string {
 }
 
 // ---------------------------------------------------------------------------
+// Completion detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Checks whether the assistant message is a confident, standalone statement
+ * that the task is finished. Returns false for tentative, conditional, or
+ * questioning uses ("check if the task is complete", "once the task is done").
+ */
+function isCompletionStatement(text: string): boolean {
+	const lower = text.toLowerCase();
+
+	// Phrases that indicate confident completion
+	const patterns = [
+		/\b(?:the\s+)?task\s+is\s+(?:now\s+)?complete\b/,
+		/\b(?:the\s+)?task\s+is\s+(?:now\s+)?done\b/,
+		/\b(?:the\s+)?task\s+has\s+been\s+completed\b/,
+		/\bi(?:'ve|'ve|\s+have)\s+completed\s+the\s+task\b/,
+		/\b(?:the\s+)?task\s+is\s+(?:now\s+)?finished\b/,
+		/\b(?:the\s+)?solution\s+is\s+(?:now\s+)?complete\b/,
+		/\ball\s+requirements\s+(?:have\s+been|are(?:\s+now)?)\s+met\b/,
+	];
+
+	// Reject if preceded by words that make it conditional/interrogative
+	const negatingPrefixes = [
+		"check if",
+		"check whether",
+		"verify if",
+		"verify whether",
+		"verify that",
+		"ensure that",
+		"ensure the",
+		"confirm that",
+		"confirm whether",
+		"once the",
+		"when the",
+		"if the",
+		"whether the",
+		"before the",
+		"until the",
+		"not yet",
+	];
+
+	for (const pattern of patterns) {
+		const match = pattern.exec(lower);
+		if (!match) continue;
+
+		// Check 40 chars before the match for negating context
+		const preContext = lower.slice(Math.max(0, match.index - 40), match.index);
+		const isNegated = negatingPrefixes.some((prefix) => preContext.includes(prefix));
+		if (!isNegated) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Gate: do nothing unless --terminal-bench is provided
+	pi.registerFlag("terminal-bench", {
+		description: "Enable Terminal-Bench optimizations",
+		type: "boolean",
+		default: false,
+	});
+
+	let enabled = false;
 	let envSnapshot = "";
 	let completionPending = false;
 	let lastBashOutput = "";
 
 	// Gather environment snapshot on session start
 	pi.on("session_start", async (_event, _ctx) => {
+		enabled = pi.getFlag("terminal-bench") === true;
+		if (!enabled) return;
+
 		envSnapshot = "";
 		completionPending = false;
 		lastBashOutput = "";
@@ -203,12 +277,12 @@ export default function (pi: ExtensionAPI) {
 
 	// Inject guidelines and snapshot into system prompt
 	pi.on("before_agent_start", async (event, _ctx) => {
+		if (!enabled) return;
+
 		let systemPrompt = event.systemPrompt;
 
-		// Append terminal-bench guidelines
 		systemPrompt += `\n\n${TERMINAL_BENCH_GUIDELINES}`;
 
-		// Append environment snapshot if available
 		if (envSnapshot) {
 			systemPrompt += `\n\n${envSnapshot}`;
 		}
@@ -218,13 +292,14 @@ export default function (pi: ExtensionAPI) {
 
 	// Track last bash output for completion checklist
 	pi.on("tool_result", async (event, _ctx) => {
+		if (!enabled) return;
+
 		if (event.toolName === "bash" && !event.isError) {
 			const textContent = event.content
 				.filter((c) => c.type === "text")
 				.map((c) => (c as { type: "text"; text: string }).text)
 				.join("\n");
 			if (textContent) {
-				// Keep last 2000 chars for context
 				lastBashOutput = textContent.slice(-2000);
 			}
 		}
@@ -232,13 +307,13 @@ export default function (pi: ExtensionAPI) {
 
 	// Detect completion signals and inject verification
 	pi.on("message_end", async (event, ctx) => {
+		if (!enabled) return;
 		if (event.message.role !== "assistant") return;
 
 		const content = event.message.content;
-		if (!content) return;
+		if (!Array.isArray(content)) return;
 
-		// Check if assistant is signaling completion
-		const textBlocks = (Array.isArray(content) ? content : [])
+		const textBlocks = content
 			.filter(
 				(b): b is { type: "text"; text: string } =>
 					typeof b === "object" && b !== null && "type" in b && b.type === "text",
@@ -246,24 +321,11 @@ export default function (pi: ExtensionAPI) {
 			.map((b) => b.text)
 			.join("\n");
 
-		const completionSignals = [
-			"task is complete",
-			"task is done",
-			"task has been completed",
-			"i've completed the task",
-			"i have completed the task",
-			"the task is finished",
-			"all requirements have been met",
-			"all requirements are met",
-			"solution is complete",
-			"i'm done",
-			"i am done",
-		];
+		if (!textBlocks) return;
 
-		const lowerText = textBlocks.toLowerCase();
-		const isCompletionSignal = completionSignals.some((s) => lowerText.includes(s));
+		const isCompletion = isCompletionStatement(textBlocks);
 
-		if (isCompletionSignal && !completionPending) {
+		if (isCompletion && !completionPending) {
 			completionPending = true;
 
 			// Get task hint from first user message
@@ -290,8 +352,8 @@ export default function (pi: ExtensionAPI) {
 			const checklist = COMPLETION_CHECKLIST(taskHint, lastBashOutput.slice(-1000) || "(no recent output)");
 
 			pi.sendUserMessage(checklist, { deliverAs: "followUp" });
-		} else if (!isCompletionSignal) {
-			// Reset if the model is continuing work
+		} else if (!isCompletion) {
+			// Reset so a later genuine completion triggers verification again
 			completionPending = false;
 		}
 	});
