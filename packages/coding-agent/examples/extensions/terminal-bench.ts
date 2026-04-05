@@ -352,19 +352,32 @@ export default function (pi: ExtensionAPI) {
 			// Silent failure
 		}
 
-		// Discover tmux: use existing session or create one
+		// Discover tmux: use existing session or create one.
+		// Always cd into the project cwd so commands run in the right directory,
+		// even when an existing session was left in a different workspace.
+		const cwd = process.cwd();
 		try {
 			const listResult = await pi.exec("tmux", ["list-sessions", "-F", "#{session_name}"], { timeout: 5000 });
 			if (listResult.code === 0 && listResult.stdout?.trim()) {
 				// Use first available session
 				tmuxSession = listResult.stdout.trim().split("\n")[0];
 			} else {
-				// No sessions — create one
+				// No sessions — create one with the correct start directory
 				const sessionName = "pi-tbench";
-				await pi.exec("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50"], {
+				await pi.exec("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "-c", cwd], {
 					timeout: 5000,
 				});
 				tmuxSession = sessionName;
+			}
+
+			// Ensure the pane's working directory matches the project cwd.
+			// Existing sessions may have been left in a completely different repo.
+			if (tmuxSession) {
+				await pi.exec("tmux", ["send-keys", "-t", tmuxSession, `cd ${cwd.replace(/'/g, "'\\''")}`, "Enter"], {
+					timeout: 5000,
+				});
+				// Brief wait for the cd to complete before any agent interaction
+				await sleep(200);
 			}
 		} catch {
 			// tmux not available — tools will report errors when called
