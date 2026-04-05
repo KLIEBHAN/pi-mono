@@ -4,9 +4,10 @@ Runs pi as a [Terminal-Bench 2.0](https://tbench.ai) agent via [Harbor](https://
 
 ## How It Works
 
-The wrapper starts pi in RPC mode as a subprocess, sends the task instruction,
-and collects events until the agent finishes. Pi uses its `terminal-bench`
-extension for:
+The wrapper installs Node.js and pi inside the Harbor sandbox container,
+uploads the terminal-bench extension and auth credentials, then runs pi
+in print mode (`-p`) for each task. Pi uses its `terminal-bench` extension
+for:
 
 - Environment bootstrapping (sandbox snapshot)
 - Terminal-Bench-specific prompt optimizations
@@ -17,19 +18,23 @@ extension for:
 ## Prerequisites
 
 ```bash
-# Install pi globally
-npm install -g @mariozechner/pi-coding-agent
-
-# Install the terminal-bench extension globally
-mkdir -p ~/.pi/agent/extensions
-cp ../../examples/extensions/terminal-bench.ts ~/.pi/agent/extensions/
-
 # Install harbor
 pip install harbor
 
-# Set your API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# The terminal-bench extension must be at one of:
+#   ~/.pi/agent/extensions/terminal-bench.ts  (global install)
+#   ../extensions/terminal-bench.ts           (relative to this wrapper)
+# Copy it if needed:
+mkdir -p ~/.pi/agent/extensions
+cp ../extensions/terminal-bench.ts ~/.pi/agent/extensions/
+
+# Auth: either API key or subscription login
+export ANTHROPIC_API_KEY=sk-ant-...    # Option 1: API key
+# OR run `pi` then `/login` to authenticate via subscription (saves to ~/.pi/agent/auth.json)
 ```
+
+Note: Pi is installed automatically *inside* the sandbox container during
+setup. You do NOT need pi installed on the host.
 
 ## Usage
 
@@ -76,21 +81,25 @@ Edit `agent.py` to adjust:
 Harbor Orchestrator
   │
   ├── Creates sandbox environment (Docker/runloop)
-  ├── Calls PiAgent.setup() → starts pi in RPC mode
-  ├── Calls PiAgent.run(instruction) → sends prompt via RPC
-  │     │
-  │     ├── pi receives task via stdin JSON
-  │     ├── terminal-bench extension activates:
-  │     │   ├── Environment snapshot gathered
-  │     │   ├── Guidelines injected into system prompt
-  │     │   └── tmux session created
-  │     ├── pi's agent loop runs:
-  │     │   ├── bash tool for non-interactive commands
-  │     │   ├── tmux_send/tmux_read for interactive programs
-  │     │   ├── read/write/edit for file operations
-  │     │   └── Completion verification on "done" signals
-  │     ├── Events streamed back via stdout JSON
-  │     └── agent_end event signals completion
+  ├── Calls PiAgent.setup():
+  │     ├── Installs Node.js + pi in container
+  │     ├── Uploads terminal-bench.ts extension
+  │     ├── Uploads auth.json (if available)
+  │     └── Installs tmux
+  ├── Calls PiAgent.run(instruction):
+  │     ├── Writes task to /tmp/pi-task.txt in container
+  │     ├── Runs `pi -p --terminal-bench ...` in container
+  │     │   ├── terminal-bench extension activates:
+  │     │   │   ├── Environment snapshot gathered
+  │     │   │   ├── Guidelines injected into system prompt
+  │     │   │   └── tmux session created
+  │     │   ├── pi's agent loop runs:
+  │     │   │   ├── bash tool for non-interactive commands
+  │     │   │   ├── tmux_send/tmux_read for interactive programs
+  │     │   │   ├── read/write/edit for file operations
+  │     │   │   └── Completion verification on "done" signals
+  │     │   └── pi exits when done
+  │     └── Downloads error log for debugging
   │
-  └── PiAgent populates AgentContext (tokens, cost)
+  └── Harbor runs verifier to score the result
 ```
