@@ -1,33 +1,32 @@
 """
 Harbor wrapper for pi coding agent.
 
-Runs pi in RPC mode as a subprocess inside the Harbor sandbox environment,
-bridging Harbor's agent interface with pi's RPC protocol. Pi uses its
-terminal-bench extension for environment bootstrapping, prompt optimizations,
-completion verification, and tmux-based terminal interaction.
+Installs pi inside the Harbor sandbox container and runs it in print mode.
+Pi uses its terminal-bench extension for environment bootstrapping, prompt
+optimizations, completion verification, and tmux-based terminal interaction.
 
 Usage:
     harbor run \
         --agent-import-path agent:PiAgent \
         -d terminal-bench@2.0 \
-        -m anthropic/claude-sonnet-4-20250514 \
+        -m anthropic/claude-opus-4-6 \
         -e runloop \
         -n 20 \
         --n-attempts 5
 
 Requires:
-    - pi installed globally: npm install -g @mariozechner/pi-coding-agent
-    - harbor installed: pip install harbor
+    - harbor: pip install harbor
     - terminal-bench extension at ~/.pi/agent/extensions/terminal-bench.ts
+      (or next to this file at ../extensions/terminal-bench.ts)
+    - auth.json at ~/.pi/agent/auth.json (for subscription auth)
+      OR ANTHROPIC_API_KEY set in environment
 """
 
-import asyncio
+import base64
 import json
 import logging
-import shutil
-import time
+import os
 from pathlib import Path
-from typing import Any
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
@@ -35,31 +34,36 @@ from harbor.models.agent.context import AgentContext
 
 _LOGGER = logging.getLogger(__name__)
 
-# How long to wait for pi to become idle after sending a prompt (seconds).
-# Terminal-bench tasks can take a very long time.
-TASK_TIMEOUT_SEC = 30 * 60  # 30 minutes
+# Per-task timeout in seconds (30 minutes).
+TASK_TIMEOUT_SEC = 30 * 60
+
+# Node.js version to install in the container.
+NODE_VERSION = "22.16.0"
+
+# Paths on host
+_HOST_AUTH = Path.home() / ".pi" / "agent" / "auth.json"
+_HOST_EXTENSION = Path(__file__).parent.parent / "extensions" / "terminal-bench.ts"
+_HOST_EXTENSION_GLOBAL = Path.home() / ".pi" / "agent" / "extensions" / "terminal-bench.ts"
+
+# Paths inside the container
+_REMOTE_PI_DIR = "/root/.pi/agent"
+_REMOTE_AUTH = f"{_REMOTE_PI_DIR}/auth.json"
+_REMOTE_EXT_DIR = f"{_REMOTE_PI_DIR}/extensions"
+_REMOTE_EXT = f"{_REMOTE_EXT_DIR}/terminal-bench.ts"
+_REMOTE_TASK = "/tmp/pi-task.txt"
+_REMOTE_ERRORS = "/tmp/pi-errors.log"
 
 
-def _find_pi_binary() -> str:
-    """Locate the pi binary."""
-    pi_path = shutil.which("pi")
-    if pi_path:
-        return pi_path
-    # Common npm global install locations
-    for candidate in [
-        Path.home() / ".npm-global" / "bin" / "pi",
-        Path("/usr/local/bin/pi"),
-        Path("/usr/bin/pi"),
-    ]:
+def _find_extension() -> Path | None:
+    """Locate the terminal-bench extension on the host."""
+    for candidate in [_HOST_EXTENSION, _HOST_EXTENSION_GLOBAL]:
         if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError(
-        "Could not find 'pi' binary. Install with: npm install -g @mariozechner/pi-coding-agent"
-    )
+            return candidate
+    return None
 
 
 def _parse_model_arg(model_name: str | None) -> tuple[str | None, str | None]:
-    """Parse 'provider/model' into (provider, model) tuple."""
+    """Parse 'provider/model-id' into (provider, model_id)."""
     if not model_name:
         return None, None
     if "/" in model_name:
@@ -68,177 +72,14 @@ def _parse_model_arg(model_name: str | None) -> tuple[str | None, str | None]:
     return None, model_name
 
 
-class PiRpcClient:
-    """Manages a pi subprocess in RPC mode and provides a simple send/receive API."""
-
-    def __init__(self, proc: asyncio.subprocess.Process):
-        self._proc = proc
-        self._reader_task: asyncio.Task | None = None
-        self._response_waiters: dict[str, asyncio.Future] = {}
-        self._event_queue: asyncio.Queue = asyncio.Queue()
-        self._req_counter = 0
-        self._started = False
-
-    async def start(self) -> None:
-        """Start the background reader task."""
-        if self._started:
-            return
-        self._started = True
-        self._reader_task = asyncio.create_task(self._read_loop())
-
-    async def _read_loop(self) -> None:
-        """Read lines from pi's stdout and dispatch responses vs events."""
-        assert self._proc.stdout is not None
-        while True:
-            raw = await self._proc.stdout.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8").strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                _LOGGER.warning("Non-JSON line from pi: %s", line[:200])
-                continue
-
-            msg_type = msg.get("type", "")
-
-            # Responses have type "response" and carry an "id" field
-            if msg_type == "response":
-                req_id = msg.get("id")
-                if req_id and req_id in self._response_waiters:
-                    self._response_waiters[req_id].set_result(msg)
-                    del self._response_waiters[req_id]
-                continue
-
-            # Extension UI requests — auto-cancel dialogs
-            if msg_type == "extension_ui_request":
-                method = msg.get("method", "")
-                ui_id = msg.get("id")
-                if method in ("select", "confirm", "input", "editor") and ui_id:
-                    # Cancel all dialog prompts — pi runs unattended
-                    cancel_msg = {
-                        "type": "extension_ui_response",
-                        "id": ui_id,
-                        "cancelled": True,
-                    }
-                    await self._send_raw(cancel_msg)
-                continue
-
-            # Everything else is an event
-            await self._event_queue.put(msg)
-
-    async def _send_raw(self, obj: dict) -> None:
-        """Send a JSON line to pi's stdin."""
-        assert self._proc.stdin is not None
-        data = json.dumps(obj) + "\n"
-        self._proc.stdin.write(data.encode("utf-8"))
-        await self._proc.stdin.drain()
-
-    async def send_command(self, cmd: dict, timeout: float = 30.0) -> dict:
-        """Send a command and wait for its response."""
-        self._req_counter += 1
-        req_id = f"req-{self._req_counter}"
-        cmd["id"] = req_id
-
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
-        self._response_waiters[req_id] = future
-
-        await self._send_raw(cmd)
-
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._response_waiters.pop(req_id, None)
-            raise
-
-    async def wait_for_event(
-        self,
-        event_type: str,
-        timeout: float | None = None,
-    ) -> dict | None:
-        """Wait for a specific event type. Returns None on timeout."""
-        deadline = time.monotonic() + timeout if timeout else None
-        while True:
-            remaining = None
-            if deadline:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-            try:
-                event = await asyncio.wait_for(
-                    self._event_queue.get(),
-                    timeout=remaining,
-                )
-                if event.get("type") == event_type:
-                    return event
-                # Discard non-matching events (they're consumed)
-            except asyncio.TimeoutError:
-                return None
-
-    async def drain_until_idle(
-        self,
-        timeout: float = TASK_TIMEOUT_SEC,
-        on_event: Any = None,
-    ) -> list[dict]:
-        """Drain events until agent_end, collecting all events."""
-        events: list[dict] = []
-        deadline = time.monotonic() + timeout
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _LOGGER.warning("Timeout waiting for agent_end")
-                break
-
-            try:
-                event = await asyncio.wait_for(
-                    self._event_queue.get(),
-                    timeout=min(remaining, 5.0),
-                )
-            except asyncio.TimeoutError:
-                # Check if process died
-                if self._proc.returncode is not None:
-                    _LOGGER.warning("pi process exited with code %d", self._proc.returncode)
-                    break
-                continue
-
-            events.append(event)
-            if on_event:
-                on_event(event)
-
-            if event.get("type") == "agent_end":
-                break
-
-        return events
-
-    async def stop(self) -> None:
-        """Terminate the pi process."""
-        if self._proc.returncode is None:
-            try:
-                self._proc.terminate()
-                await asyncio.wait_for(self._proc.wait(), timeout=10)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                self._proc.kill()
-        if self._reader_task:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-
-
 class PiAgent(BaseAgent):
-    """Harbor agent that delegates to pi in RPC mode."""
+    """Harbor agent that installs and runs pi inside the sandbox container."""
 
-    SUPPORTS_ATIF: bool = False  # We don't produce ATIF trajectories
+    SUPPORTS_ATIF: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._rpc: PiRpcClient | None = None
-        self._pi_proc: asyncio.subprocess.Process | None = None
+        self._provider, self._model_id = _parse_model_arg(self.model_name)
 
     @staticmethod
     def name() -> str:
@@ -248,39 +89,68 @@ class PiAgent(BaseAgent):
         return "1.0.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        """Start pi in RPC mode."""
-        pi_bin = _find_pi_binary()
-        provider, model_id = _parse_model_arg(self.model_name)
+        """Install Node.js, pi, tmux, and upload config into the container."""
+        _LOGGER.info("Setting up pi in container...")
 
-        cmd = [
-            pi_bin,
-            "--mode", "rpc",
-            "--no-session",
-            "--terminal-bench",
-            "--thinking", "high",
-        ]
-
-        if provider:
-            cmd.extend(["--provider", provider])
-        if model_id:
-            cmd.extend(["--model", model_id])
-
-        _LOGGER.info("Starting pi: %s", " ".join(cmd))
-
-        self._pi_proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # 1. System dependencies (curl for Node.js download, tmux for tmux tools)
+        _LOGGER.info("Installing system dependencies...")
+        await environment.exec(
+            "apt-get update -qq && apt-get install -y -qq curl tmux xz-utils > /dev/null 2>&1",
+            timeout_sec=180,
         )
 
-        self._rpc = PiRpcClient(self._pi_proc)
-        await self._rpc.start()
+        # 2. Node.js from binary tarball (faster than nodesource apt repo)
+        _LOGGER.info("Installing Node.js %s...", NODE_VERSION)
+        await environment.exec(
+            "ARCH=$(uname -m); "
+            "case $ARCH in x86_64) NA=x64;; aarch64|arm64) NA=arm64;; *) NA=x64;; esac; "
+            f'curl -fsSL "https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-linux-${{NA}}.tar.xz" '
+            "| tar -xJ -C /usr/local --strip-components=1",
+            timeout_sec=120,
+        )
 
-        # Wait briefly for pi to initialize
-        await asyncio.sleep(2)
+        # Verify node works
+        result = await environment.exec("node --version", timeout_sec=10)
+        _LOGGER.info("Node.js installed: %s", (result.stdout or "").strip())
 
-        _LOGGER.info("pi started (pid=%d)", self._pi_proc.pid or 0)
+        # 3. Install pi
+        _LOGGER.info("Installing pi coding agent...")
+        await environment.exec(
+            "npm install -g @mariozechner/pi-coding-agent 2>&1 | tail -5",
+            timeout_sec=300,
+        )
+
+        result = await environment.exec("pi --version", timeout_sec=10)
+        _LOGGER.info("pi installed: %s", (result.stdout or "").strip())
+
+        # 4. Upload terminal-bench extension
+        ext_path = _find_extension()
+        if ext_path:
+            _LOGGER.info("Uploading terminal-bench extension from %s", ext_path)
+            await environment.exec(f"mkdir -p {_REMOTE_EXT_DIR}", timeout_sec=5)
+            await environment.upload_file(str(ext_path), _REMOTE_EXT)
+        else:
+            _LOGGER.warning(
+                "terminal-bench extension not found. "
+                "Expected at %s or %s",
+                _HOST_EXTENSION,
+                _HOST_EXTENSION_GLOBAL,
+            )
+
+        # 5. Upload auth.json for subscription auth (if available)
+        if _HOST_AUTH.exists():
+            _LOGGER.info("Uploading auth.json for subscription auth")
+            await environment.exec(f"mkdir -p {_REMOTE_PI_DIR}", timeout_sec=5)
+            await environment.upload_file(str(_HOST_AUTH), _REMOTE_AUTH)
+        elif os.environ.get("ANTHROPIC_API_KEY"):
+            _LOGGER.info("Using ANTHROPIC_API_KEY from environment")
+        else:
+            _LOGGER.warning(
+                "No auth.json and no ANTHROPIC_API_KEY. "
+                "Pi may not be able to authenticate."
+            )
+
+        _LOGGER.info("Setup complete.")
 
     async def run(
         self,
@@ -288,80 +158,71 @@ class PiAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        """Send the task instruction to pi and wait for completion."""
-        if not self._rpc:
-            raise RuntimeError("pi not started — call setup() first")
+        """Run pi in print mode inside the container."""
+        _LOGGER.info("Running pi on task (%d chars)", len(instruction))
 
-        # Track metrics
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_cache_tokens = 0
-        total_cost = 0.0
-        start_time = time.time()
-
-        def on_event(event: dict) -> None:
-            nonlocal total_input_tokens, total_output_tokens, total_cache_tokens, total_cost
-
-            event_type = event.get("type", "")
-
-            # Extract token usage from message_end events for assistant messages
-            if event_type == "message_end":
-                message = event.get("message", {})
-                if message.get("role") == "assistant":
-                    usage = message.get("usage", {})
-                    total_input_tokens += usage.get("input", 0)
-                    total_output_tokens += usage.get("output", 0)
-                    total_cache_tokens += usage.get("cacheRead", 0)
-                    cost = usage.get("cost", {})
-                    total_cost += cost.get("total", 0)
-
-            # Log tool calls for observability
-            if event_type == "tool_execution_start":
-                tool_name = event.get("toolName", "?")
-                _LOGGER.debug("Tool call: %s", tool_name)
-
-            if event_type == "tool_execution_end":
-                tool_name = event.get("toolName", "?")
-                is_error = event.get("isError", False)
-                if is_error:
-                    _LOGGER.warning("Tool error: %s", tool_name)
-
-        # Send the task instruction
-        _LOGGER.info("Sending task instruction (%d chars)", len(instruction))
-        response = await self._rpc.send_command(
-            {"type": "prompt", "message": instruction},
-            timeout=30,
+        # Write instruction to file via base64 to avoid any shell escaping issues
+        encoded = base64.b64encode(instruction.encode("utf-8")).decode("ascii")
+        await environment.exec(
+            f"echo '{encoded}' | base64 -d > {_REMOTE_TASK}",
+            timeout_sec=10,
         )
 
-        if not response.get("success"):
-            error = response.get("error", "unknown error")
-            _LOGGER.error("Failed to send prompt: %s", error)
-            return
+        # Build pi command
+        cmd_parts = [
+            "pi", "-p",
+            "--terminal-bench",
+            "--thinking", "high",
+            "--no-session",
+        ]
 
-        # Wait for the agent to finish
-        events = await self._rpc.drain_until_idle(
-            timeout=TASK_TIMEOUT_SEC,
-            on_event=on_event,
+        if self._provider:
+            cmd_parts.extend(["--provider", self._provider])
+        if self._model_id:
+            cmd_parts.extend(["--model", self._model_id])
+
+        # Pass API key as env var if set on host
+        env_vars: dict[str, str] = {}
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "XAI_API_KEY",
+        ]:
+            val = os.environ.get(key)
+            if val:
+                env_vars[key] = val
+
+        # @file passes file content as the prompt
+        cmd_parts.append(f"@{_REMOTE_TASK}")
+
+        # Redirect stderr to file for debugging
+        cmd = " ".join(cmd_parts) + f" 2>{_REMOTE_ERRORS}"
+
+        _LOGGER.info("Executing: %s", cmd)
+
+        result = await environment.exec(
+            cmd,
+            env=env_vars if env_vars else None,
+            timeout_sec=TASK_TIMEOUT_SEC,
         )
 
-        elapsed = time.time() - start_time
-        _LOGGER.info(
-            "pi finished in %.1fs — %d events, %d input tokens, %d output tokens, $%.4f",
-            elapsed,
-            len(events),
-            total_input_tokens,
-            total_output_tokens,
-            total_cost,
-        )
+        # Log result
+        exit_code = result.return_code
+        stdout_preview = (result.stdout or "")[:500]
+        _LOGGER.info("pi exited with code %s", exit_code)
+        if stdout_preview:
+            _LOGGER.info("pi output (first 500 chars): %s", stdout_preview)
 
-        # Populate Harbor's AgentContext
-        context.n_input_tokens = total_input_tokens
-        context.n_output_tokens = total_output_tokens
-        context.n_cache_tokens = total_cache_tokens
-        context.cost_usd = total_cost if total_cost > 0 else None
-
-        # Stop pi
+        # Download error log for debugging
         try:
-            await self._rpc.stop()
+            local_errors = self.logs_dir / "pi-errors.log"
+            await environment.download_file(_REMOTE_ERRORS, str(local_errors))
+            error_content = local_errors.read_text(errors="replace").strip()
+            if error_content:
+                _LOGGER.info("pi stderr (last 500 chars): %s", error_content[-500:])
         except Exception:
-            _LOGGER.debug("Error stopping pi", exc_info=True)
+            _LOGGER.debug("Could not download pi error log", exc_info=True)
+
+        if exit_code != 0:
+            _LOGGER.error("pi failed with exit code %s", exit_code)
