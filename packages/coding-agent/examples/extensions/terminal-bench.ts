@@ -15,6 +15,16 @@
  *    to the system prompt (no human help, programmatic multimedia handling,
  *    minimal state changes, cleanup).
  *
+ * 4. **tmux Tools**: Registers `tmux_send` and `tmux_read` tools for
+ *    keystroke-level terminal interaction. Enables the agent to drive
+ *    interactive programs (vim, gdb, interactive prompts, Ctrl+C, etc.)
+ *    that pi's standard `bash` tool cannot handle. Includes marker-based
+ *    polling for early completion detection.
+ *
+ * 5. **Aggressive Output Truncation**: Reduces bash output from 50KB/2000
+ *    lines to 30KB/1500 lines when active, so more turns fit in the
+ *    context window.
+ *
  * The extension is gated behind the --terminal-bench flag and does nothing
  * unless that flag is provided. This avoids side effects during normal usage.
  *
@@ -26,6 +36,15 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const TBENCH_MAX_BYTES = 30 * 1024; // 30KB (down from 50KB)
+const TBENCH_MAX_LINES = 1500; // (down from 2000)
+const TMUX_MARKER_PREFIX = "__PI_TBENCH_END__";
 
 // ---------------------------------------------------------------------------
 // Prompt additions
@@ -50,6 +69,9 @@ const TERMINAL_BENCH_GUIDELINES = `
   waiting indefinitely.
 - When you believe the task is complete, re-read the original task description
   and verify your solution meets ALL requirements before confirming.
+- For interactive programs or commands that need special key sequences
+  (Ctrl+C, Ctrl+D, arrow keys, etc.), use the tmux_send tool instead of bash.
+  Use tmux_read to inspect the current terminal state at any time.
 `.trim();
 
 const COMPLETION_CHECKLIST = (taskHint: string, terminalState: string) =>
@@ -192,7 +214,6 @@ function formatSnapshot(sections: BootstrapSections): string {
 function isCompletionStatement(text: string): boolean {
 	const lower = text.toLowerCase();
 
-	// Phrases that indicate confident completion
 	const patterns = [
 		/\b(?:the\s+)?task\s+is\s+(?:now\s+)?complete\b/,
 		/\b(?:the\s+)?task\s+is\s+(?:now\s+)?done\b/,
@@ -203,7 +224,6 @@ function isCompletionStatement(text: string): boolean {
 		/\ball\s+requirements\s+(?:have\s+been|are(?:\s+now)?)\s+met\b/,
 	];
 
-	// Reject if preceded by words that make it conditional/interrogative
 	const negatingPrefixes = [
 		"check if",
 		"check whether",
@@ -227,7 +247,6 @@ function isCompletionStatement(text: string): boolean {
 		const match = pattern.exec(lower);
 		if (!match) continue;
 
-		// Check 40 chars before the match for negating context
 		const preContext = lower.slice(Math.max(0, match.index - 40), match.index);
 		const isNegated = negatingPrefixes.some((prefix) => preContext.includes(prefix));
 		if (!isNegated) {
@@ -236,6 +255,57 @@ function isCompletionStatement(text: string): boolean {
 	}
 
 	return false;
+}
+
+// ---------------------------------------------------------------------------
+// tmux helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Truncate output to the configured byte/line limits.
+ * Simple tail truncation: keeps the last N lines within the byte budget.
+ */
+function truncateOutput(output: string, maxBytes: number, maxLines: number): string {
+	const lines = output.split("\n");
+
+	if (lines.length <= maxLines && Buffer.byteLength(output, "utf-8") <= maxBytes) {
+		return output;
+	}
+
+	// Work backwards, collecting lines that fit
+	const kept: string[] = [];
+	let bytes = 0;
+
+	for (let i = lines.length - 1; i >= 0 && kept.length < maxLines; i--) {
+		const lineBytes = Buffer.byteLength(lines[i], "utf-8") + (kept.length > 0 ? 1 : 0);
+		if (bytes + lineBytes > maxBytes) break;
+		kept.unshift(lines[i]);
+		bytes += lineBytes;
+	}
+
+	const totalLines = lines.length;
+	const shownLines = kept.length;
+
+	if (shownLines < totalLines) {
+		return `[Showing last ${shownLines} of ${totalLines} lines]\n${kept.join("\n")}`;
+	}
+	return kept.join("\n");
+}
+
+/**
+ * Remove marker echo lines from tmux output so the LLM sees clean output.
+ */
+function stripMarkerLines(output: string, markers: Set<string>): string {
+	if (markers.size === 0) return output;
+	return output
+		.split("\n")
+		.filter((line) => {
+			for (const marker of markers) {
+				if (line.includes(marker)) return false;
+			}
+			return true;
+		})
+		.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +324,13 @@ export default function (pi: ExtensionAPI) {
 	let envSnapshot = "";
 	let completionPending = false;
 	let lastBashOutput = "";
+	let tmuxSession = "";
+	let markerSeq = 0;
 
-	// Gather environment snapshot on session start
+	// -----------------------------------------------------------------------
+	// Session start: bootstrap + tmux discovery
+	// -----------------------------------------------------------------------
+
 	pi.on("session_start", async (_event, _ctx) => {
 		enabled = pi.getFlag("terminal-bench") === true;
 		if (!enabled) return;
@@ -263,7 +338,10 @@ export default function (pi: ExtensionAPI) {
 		envSnapshot = "";
 		completionPending = false;
 		lastBashOutput = "";
+		tmuxSession = "";
+		markerSeq = 0;
 
+		// Environment bootstrapping
 		try {
 			const result = await pi.exec("bash", ["-c", BOOTSTRAP_COMMAND], { timeout: 15000 });
 			if (result.code === 0 && result.stdout) {
@@ -271,11 +349,32 @@ export default function (pi: ExtensionAPI) {
 				envSnapshot = formatSnapshot(sections);
 			}
 		} catch {
-			// Silent failure — don't break the agent
+			// Silent failure
+		}
+
+		// Discover tmux: use existing session or create one
+		try {
+			const listResult = await pi.exec("tmux", ["list-sessions", "-F", "#{session_name}"], { timeout: 5000 });
+			if (listResult.code === 0 && listResult.stdout?.trim()) {
+				// Use first available session
+				tmuxSession = listResult.stdout.trim().split("\n")[0];
+			} else {
+				// No sessions — create one
+				const sessionName = "pi-tbench";
+				await pi.exec("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50"], {
+					timeout: 5000,
+				});
+				tmuxSession = sessionName;
+			}
+		} catch {
+			// tmux not available — tools will report errors when called
 		}
 	});
 
-	// Inject guidelines and snapshot into system prompt
+	// -----------------------------------------------------------------------
+	// System prompt injection
+	// -----------------------------------------------------------------------
+
 	pi.on("before_agent_start", async (event, _ctx) => {
 		if (!enabled) return;
 
@@ -287,25 +386,194 @@ export default function (pi: ExtensionAPI) {
 			systemPrompt += `\n\n${envSnapshot}`;
 		}
 
+		if (tmuxSession) {
+			systemPrompt += `\n\n[tmux session "${tmuxSession}" is available. Use tmux_send/tmux_read for interactive programs.]`;
+		}
+
 		return { systemPrompt };
 	});
 
-	// Track last bash output for completion checklist
+	// -----------------------------------------------------------------------
+	// Tool: tmux_send
+	// -----------------------------------------------------------------------
+
+	pi.registerTool({
+		name: "tmux_send",
+		label: "tmux Send",
+		description:
+			"Send keystrokes to the tmux terminal session and return the resulting output. " +
+			"Use this for interactive programs, special key sequences (Ctrl+C, Ctrl+D, arrow keys), " +
+			"or when you need to observe the terminal state after a command. " +
+			"Most shell commands should end with a newline (\\n) to execute. " +
+			"For special keys, use tmux key names: C-c for Ctrl+C, C-d for Ctrl+D, " +
+			"Enter for Return, Escape for Esc, Up/Down/Left/Right for arrow keys. " +
+			"Set wait_seconds to control how long to wait for output (default: 1). " +
+			"For fast commands (cd, echo) use 0.1. For slow commands (make, compilation) use higher values. " +
+			"Never set wait_seconds above 30; prefer to poll with tmux_read instead.",
+		promptSnippet: "Send keystrokes to tmux and capture terminal output",
+		parameters: Type.Object({
+			keys: Type.String({
+				description:
+					"Keystrokes to send. Text is sent verbatim. " +
+					"End shell commands with \\n. " +
+					"For special keys use tmux names: C-c, C-d, Enter, Escape, Up, Down, Left, Right, Tab, BSpace.",
+			}),
+			wait_seconds: Type.Optional(
+				Type.Number({
+					description: "Seconds to wait for output (default: 1.0, max: 30). Use 0.1 for instant commands.",
+				}),
+			),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+			if (!tmuxSession) {
+				throw new Error("No tmux session available. Is tmux installed?");
+			}
+			if (signal?.aborted) {
+				throw new Error("Aborted");
+			}
+
+			const waitSeconds = Math.min(Math.max(params.wait_seconds ?? 1.0, 0.05), 30);
+
+			// Send keystrokes
+			const sendResult = await pi.exec("tmux", ["send-keys", "-t", tmuxSession, params.keys], {
+				timeout: 10000,
+			});
+			if (sendResult.code !== 0) {
+				throw new Error(`tmux send-keys failed: ${sendResult.stderr || "unknown error"}`);
+			}
+
+			// Send a marker echo so we can detect early completion
+			markerSeq++;
+			const marker = `${TMUX_MARKER_PREFIX}${markerSeq}`;
+			await pi.exec("tmux", ["send-keys", "-t", tmuxSession, `echo '${marker}'`, "Enter"], {
+				timeout: 5000,
+			});
+
+			// Poll for marker or wait for duration
+			const startTime = Date.now();
+			const deadlineMs = waitSeconds * 1000;
+			let paneContent = "";
+
+			// Initial short wait to let the command start
+			await sleep(Math.min(300, deadlineMs), signal);
+
+			while (Date.now() - startTime < deadlineMs) {
+				if (signal?.aborted) break;
+
+				const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+					timeout: 5000,
+				});
+				paneContent = captureResult.stdout || "";
+
+				if (paneContent.includes(marker)) {
+					break; // Command finished early
+				}
+
+				await sleep(500, signal);
+			}
+
+			// Final capture to get the latest state
+			const finalCapture = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+				timeout: 5000,
+			});
+			paneContent = finalCapture.stdout || "";
+
+			// Strip marker lines from output
+			const markers = new Set<string>();
+			for (let i = 1; i <= markerSeq; i++) {
+				markers.add(`${TMUX_MARKER_PREFIX}${i}`);
+			}
+			const cleanOutput = stripMarkerLines(paneContent, markers).trim();
+			const truncated = truncateOutput(cleanOutput, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
+
+			return {
+				content: [{ type: "text", text: truncated || "(no output)" }],
+				details: {},
+			};
+		},
+	});
+
+	// -----------------------------------------------------------------------
+	// Tool: tmux_read
+	// -----------------------------------------------------------------------
+
+	pi.registerTool({
+		name: "tmux_read",
+		label: "tmux Read",
+		description:
+			"Capture the current content of the tmux terminal pane without sending any keystrokes. " +
+			"Use this to check the state of a running program, inspect output after waiting, " +
+			"or read the terminal before deciding what to do next.",
+		promptSnippet: "Read current tmux terminal content without sending input",
+		parameters: Type.Object({}),
+
+		async execute(_toolCallId, _params, signal, _onUpdate, _ctx) {
+			if (!tmuxSession) {
+				throw new Error("No tmux session available. Is tmux installed?");
+			}
+			if (signal?.aborted) {
+				throw new Error("Aborted");
+			}
+
+			const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+				timeout: 5000,
+			});
+
+			if (captureResult.code !== 0) {
+				throw new Error(`tmux capture-pane failed: ${captureResult.stderr || "unknown error"}`);
+			}
+
+			// Strip any leftover markers
+			const markers = new Set<string>();
+			for (let i = 1; i <= markerSeq; i++) {
+				markers.add(`${TMUX_MARKER_PREFIX}${i}`);
+			}
+			const cleanOutput = stripMarkerLines(captureResult.stdout || "", markers).trim();
+			const truncated = truncateOutput(cleanOutput, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
+
+			return {
+				content: [{ type: "text", text: truncated || "(empty terminal)" }],
+				details: {},
+			};
+		},
+	});
+
+	// -----------------------------------------------------------------------
+	// Aggressive output truncation for bash tool
+	// -----------------------------------------------------------------------
+
 	pi.on("tool_result", async (event, _ctx) => {
 		if (!enabled) return;
 
 		if (event.toolName === "bash" && !event.isError) {
-			const textContent = event.content
-				.filter((c) => c.type === "text")
-				.map((c) => (c as { type: "text"; text: string }).text)
-				.join("\n");
-			if (textContent) {
-				lastBashOutput = textContent.slice(-2000);
+			const textBlocks = event.content.filter((c): c is { type: "text"; text: string } => c.type === "text");
+
+			// Track last output for completion checklist
+			const fullText = textBlocks.map((b) => b.text).join("\n");
+			if (fullText) {
+				lastBashOutput = fullText.slice(-2000);
 			}
+
+			// Re-truncate if output exceeds our stricter limits
+			for (const block of textBlocks) {
+				const bytes = Buffer.byteLength(block.text, "utf-8");
+				const lines = block.text.split("\n").length;
+
+				if (bytes > TBENCH_MAX_BYTES || lines > TBENCH_MAX_LINES) {
+					block.text = truncateOutput(block.text, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
+				}
+			}
+
+			// Return modified content
+			return { content: event.content };
 		}
 	});
 
-	// Detect completion signals and inject verification
+	// -----------------------------------------------------------------------
+	// Completion verification
+	// -----------------------------------------------------------------------
+
 	pi.on("message_end", async (event, ctx) => {
 		if (!enabled) return;
 		if (event.message.role !== "assistant") return;
@@ -328,7 +596,6 @@ export default function (pi: ExtensionAPI) {
 		if (isCompletion && !completionPending) {
 			completionPending = true;
 
-			// Get task hint from first user message
 			const entries = ctx.sessionManager.getBranch();
 			let taskHint = "(not available in context)";
 			for (const entry of entries) {
@@ -350,11 +617,31 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const checklist = COMPLETION_CHECKLIST(taskHint, lastBashOutput.slice(-1000) || "(no recent output)");
-
 			pi.sendUserMessage(checklist, { deliverAs: "followUp" });
 		} else if (!isCompletion) {
-			// Reset so a later genuine completion triggers verification again
 			completionPending = false;
+		}
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		if (signal) {
+			const onAbort = () => {
+				clearTimeout(timer);
+				resolve();
+			};
+			if (signal.aborted) {
+				clearTimeout(timer);
+				resolve();
+			} else {
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
 		}
 	});
 }
