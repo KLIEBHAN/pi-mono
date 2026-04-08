@@ -68,6 +68,16 @@ harbor run \
   -n 20
 ```
 
+## Debugging
+
+Each Harbor trial stores pi process logs under the trial's `agent/` directory:
+
+- `agent/pi-stdout.log` - captured pi stdout
+- `agent/pi-errors.log` - captured pi stderr
+
+These logs are downloaded even when the agent times out, which makes postmortem
+analysis easier for difficult tasks.
+
 ## Configuration
 
 The wrapper passes `--terminal-bench --thinking high` to pi by default.
@@ -103,7 +113,9 @@ Harbor Orchestrator
   │     │   │   ├── read/write/edit for file operations
   │     │   │   └── Completion verification on "done" signals
   │     │   └── pi exits when done
-  │     └── Downloads error log for debugging
+  │     └── Downloads stdout/stderr logs for debugging
+  │         ├── agent/pi-stdout.log
+  │         └── agent/pi-errors.log
   │
   └── Harbor runs verifier to score the result
 ```
