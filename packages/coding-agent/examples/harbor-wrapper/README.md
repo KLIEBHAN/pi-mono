@@ -5,9 +5,10 @@ Runs pi as a [Terminal-Bench 2.0](https://tbench.ai) agent via [Harbor](https://
 ## How It Works
 
 The wrapper installs Node.js and pi inside the Harbor sandbox container,
-uploads the terminal-bench extension and auth credentials, then runs pi
-in print mode (`-p`) for each task. Pi uses its `terminal-bench` extension
-for:
+uploads the terminal-bench extension and auth credentials, injects an
+`ANTHROPIC_OAUTH_TOKEN` from `auth.json` when available, then runs pi
+in print mode (`-p`) for each task from `/app` when that directory exists.
+Pi uses its `terminal-bench` extension for:
 
 - Environment bootstrapping (sandbox snapshot)
 - Terminal-Bench-specific prompt optimizations
@@ -31,6 +32,7 @@ cp ../extensions/terminal-bench.ts ~/.pi/agent/extensions/
 # Auth: either API key or subscription login
 export ANTHROPIC_API_KEY=sk-ant-...    # Option 1: API key
 # OR run `pi` then `/login` to authenticate via subscription (saves to ~/.pi/agent/auth.json)
+# The wrapper uploads auth.json and extracts the Anthropic OAuth access token automatically.
 ```
 
 Note: Pi is installed automatically *inside* the sandbox container during
@@ -85,10 +87,12 @@ Harbor Orchestrator
   │     ├── Installs Node.js + pi in container
   │     ├── Uploads terminal-bench.ts extension
   │     ├── Uploads auth.json (if available)
+  │     ├── Sets PI_CODING_AGENT_DIR in-container
   │     └── Installs tmux
   ├── Calls PiAgent.run(instruction):
   │     ├── Writes task to /tmp/pi-task.txt in container
   │     ├── Runs `pi -p --terminal-bench ...` in container
+  │     │   ├── Runs from /app when present
   │     │   ├── terminal-bench extension activates:
   │     │   │   ├── Environment snapshot gathered
   │     │   │   ├── Guidelines injected into system prompt
