@@ -25,6 +25,17 @@ export interface CreateAgentSessionRuntimeResult extends CreateAgentSessionResul
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
+export type AgentSessionRuntimeSessionChangeReason = "current" | "resume" | "new" | "fork" | "import";
+
+export interface AgentSessionRuntimeSessionChangeEvent {
+	reason: AgentSessionRuntimeSessionChangeReason;
+	session: AgentSession;
+	services: AgentSessionServices;
+	previousSessionFile?: string;
+}
+
+export type AgentSessionRuntimeSessionChangeListener = (event: AgentSessionRuntimeSessionChangeEvent) => void;
+
 /**
  * Creates a full runtime for a target cwd and session manager.
  *
@@ -79,6 +90,7 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
+	private readonly _sessionChangeListeners = new Set<AgentSessionRuntimeSessionChangeListener>();
 
 	constructor(
 		_session: AgentSession,
@@ -184,10 +196,44 @@ export class AgentSessionRuntime {
 		this._modelFallbackMessage = result.modelFallbackMessage;
 	}
 
-	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
+	private _emitSessionChange(reason: AgentSessionRuntimeSessionChangeReason, previousSessionFile?: string): void {
+		const event: AgentSessionRuntimeSessionChangeEvent = {
+			reason,
+			session: this._session,
+			services: this._services,
+			previousSessionFile,
+		};
+		for (const listener of this._sessionChangeListeners) {
+			listener(event);
+		}
+	}
+
+	subscribeSessionChanges(
+		listener: AgentSessionRuntimeSessionChangeListener,
+		options?: { emitCurrent?: boolean },
+	): () => void {
+		this._sessionChangeListeners.add(listener);
+		if (options?.emitCurrent) {
+			listener({
+				reason: "current",
+				session: this._session,
+				services: this._services,
+			});
+		}
+		return () => {
+			this._sessionChangeListeners.delete(listener);
+		};
+	}
+
+	private async finishSessionReplacement(
+		reason: AgentSessionRuntimeSessionChangeReason,
+		previousSessionFile?: string,
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>,
+	): Promise<void> {
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
 		}
+		this._emitSessionChange(reason, previousSessionFile);
 		if (withSession) {
 			await withSession(this.session.createReplacedSessionContext());
 		}
@@ -219,7 +265,7 @@ export class AgentSessionRuntime {
 				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
 			}),
 		);
-		await this.finishSessionReplacement(options?.withSession);
+		await this.finishSessionReplacement("resume", previousSessionFile, options?.withSession);
 		return { cancelled: false };
 	}
 
@@ -255,7 +301,7 @@ export class AgentSessionRuntime {
 			await options.setup(this.session.sessionManager);
 			this.session.agent.state.messages = this.session.sessionManager.buildSessionContext().messages;
 		}
-		await this.finishSessionReplacement(options?.withSession);
+		await this.finishSessionReplacement("new", previousSessionFile, options?.withSession);
 		return { cancelled: false };
 	}
 
@@ -305,7 +351,7 @@ export class AgentSessionRuntime {
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 					}),
 				);
-				await this.finishSessionReplacement(options?.withSession);
+				await this.finishSessionReplacement("fork", previousSessionFile, options?.withSession);
 				return { cancelled: false, selectedText };
 			}
 
@@ -328,7 +374,7 @@ export class AgentSessionRuntime {
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 				}),
 			);
-			await this.finishSessionReplacement(options?.withSession);
+			await this.finishSessionReplacement("fork", previousSessionFile, options?.withSession);
 			return { cancelled: false, selectedText };
 		}
 
@@ -347,7 +393,7 @@ export class AgentSessionRuntime {
 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 			}),
 		);
-		await this.finishSessionReplacement(options?.withSession);
+		await this.finishSessionReplacement("fork", previousSessionFile, options?.withSession);
 		return { cancelled: false, selectedText };
 	}
 
@@ -399,7 +445,7 @@ export class AgentSessionRuntime {
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 			}),
 		);
-		await this.finishSessionReplacement();
+		await this.finishSessionReplacement("import", previousSessionFile);
 		return { cancelled: false };
 	}
 
