@@ -36,7 +36,34 @@ export ANTHROPIC_API_KEY=sk-ant-...    # Option 1: API key
 ```
 
 Note: Pi is installed automatically *inside* the sandbox container during
-setup. You do NOT need pi installed on the host.
+setup. By default, the wrapper uploads and runs the current local pi checkout,
+so unmerged local changes are used automatically.
+
+## Pi Source Mode
+
+By default the wrapper runs pi from the current local checkout.
+Optional override when the checkout is not the repo containing this wrapper:
+
+```bash
+PI_HARBOR_LOCAL_REPO=/path/to/pi-mono harbor run ...
+```
+
+In local-source mode the wrapper archives the current checkout, uploads it into
+the sandbox at `/tmp/pi-mono`, runs `HUSKY=0 npm install`, and then starts pi
+via `tsx packages/coding-agent/src/cli.ts` from that uploaded checkout.
+
+This mode expects the checkout to already contain the workspace dist files that
+pi's extension loader uses in Node.js source mode:
+
+- `packages/agent/dist/index.js`
+- `packages/ai/dist/index.js`
+- `packages/tui/dist/index.js`
+
+If you explicitly want the previously used published npm package instead, set:
+
+```bash
+PI_HARBOR_PI_SOURCE=npm harbor run ...
+```
 
 ## Usage
 
@@ -74,18 +101,79 @@ Each Harbor trial stores pi process logs under the trial's `agent/` directory:
 
 - `agent/pi-stdout.log` - captured pi stdout
 - `agent/pi-errors.log` - captured pi stderr
+- `agent/pi-trace.jsonl` - optional structured pi session trace
 
-These logs are downloaded even when the agent times out, which makes postmortem
-analysis easier for difficult tasks.
+Stdout/stderr are always downloaded, even when the agent times out.
+The structured trace is opt-in to avoid unnecessary overhead and artifact size.
+
+Enable trace capture for a Harbor run with:
+
+```bash
+PI_HARBOR_TRACE_JSONL=1 harbor run \
+  --agent-import-path agent:PiAgent \
+  -d terminal-bench@2.0 \
+  -m anthropic/claude-opus-4-6 \
+  -e docker \
+  -n 1 \
+  -t write-compressor \
+  --n-attempts 1
+```
+
+Since the wrapper now uses the local checkout by default, the current local
+`--trace-jsonl` implementation is available automatically when enabled:
+
+```bash
+PI_HARBOR_TRACE_JSONL=1 \
+harbor run \
+  --agent-import-path agent:PiAgent \
+  -d terminal-bench@2.0 \
+  -m anthropic/claude-opus-4-6 \
+  -e docker \
+  -n 1 \
+  -t write-compressor \
+  --n-attempts 1
+```
+
+You can also override the in-container trace path:
+
+```bash
+PI_HARBOR_TRACE_JSONL=/tmp/custom-pi-trace.jsonl harbor run ...
+```
+
+When enabled, the wrapper checks whether the selected in-container `pi` build
+already supports `--trace-jsonl`. If so, it passes the flag to pi and then
+downloads the resulting JSONL file as `agent/pi-trace.jsonl` for analysis.
+If `PI_HARBOR_PI_SOURCE=npm` is used with an older published `pi` release
+without that flag, the wrapper logs a warning and continues without trace
+capture instead of failing the trial.
 
 ## Configuration
 
-The wrapper passes `--terminal-bench --thinking high` to pi by default.
-Edit `agent.py` to adjust:
+The wrapper passes `--terminal-bench` to pi and uses `--thinking high` by default.
+You can override the thinking level per run without editing code:
 
-- `--thinking` level (`off`, `low`, `medium`, `high`)
-- `--tools` to restrict available tools
-- `TASK_TIMEOUT_SEC` for the per-task timeout (default: 30 minutes)
+```bash
+PI_HARBOR_THINKING=low harbor run ...
+```
+
+Valid values:
+- `off`
+- `minimal`
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+
+You can also override the wrapper's in-container pi timeout per run:
+
+```bash
+PI_HARBOR_TASK_TIMEOUT_SEC=3600 harbor run ...
+```
+
+Edit `agent.py` only if you want to change other defaults such as:
+
+- available tools
+- the default fallback for `PI_HARBOR_TASK_TIMEOUT_SEC` (30 minutes)
 
 ## Architecture
 
@@ -95,6 +183,8 @@ Harbor Orchestrator
   ├── Creates sandbox environment (Docker/runloop)
   ├── Calls PiAgent.setup():
   │     ├── Installs Node.js + pi in container
+  │     │   ├── from uploaded local checkout (default)
+  │     │   └── or from npm (opt-in)
   │     ├── Uploads terminal-bench.ts extension
   │     ├── Uploads auth.json (if available)
   │     ├── Sets PI_CODING_AGENT_DIR in-container
@@ -113,9 +203,10 @@ Harbor Orchestrator
   │     │   │   ├── read/write/edit for file operations
   │     │   │   └── Completion verification on "done" signals
   │     │   └── pi exits when done
-  │     └── Downloads stdout/stderr logs for debugging
+  │     └── Downloads logs for debugging
   │         ├── agent/pi-stdout.log
-  │         └── agent/pi-errors.log
+  │         ├── agent/pi-errors.log
+  │         └── agent/pi-trace.jsonl (optional)
   │
   └── Harbor runs verifier to score the result
 ```
