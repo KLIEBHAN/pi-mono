@@ -19,6 +19,17 @@ export interface CreateAgentSessionRuntimeResult extends CreateAgentSessionResul
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
+export type AgentSessionRuntimeSessionChangeReason = "current" | "resume" | "new" | "fork" | "import";
+
+export interface AgentSessionRuntimeSessionChangeEvent {
+	reason: AgentSessionRuntimeSessionChangeReason;
+	session: AgentSession;
+	services: AgentSessionServices;
+	previousSessionFile?: string;
+}
+
+export type AgentSessionRuntimeSessionChangeListener = (event: AgentSessionRuntimeSessionChangeEvent) => void;
+
 /**
  * Creates a full runtime for a target cwd and session manager.
  *
@@ -65,6 +76,8 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  * caller. The caller is responsible for user-facing error handling.
  */
 export class AgentSessionRuntime {
+	private readonly _sessionChangeListeners = new Set<AgentSessionRuntimeSessionChangeListener>();
+
 	constructor(
 		private _session: AgentSession,
 		private _services: AgentSessionServices,
@@ -143,6 +156,35 @@ export class AgentSessionRuntime {
 		this._modelFallbackMessage = result.modelFallbackMessage;
 	}
 
+	private _emitSessionChange(reason: AgentSessionRuntimeSessionChangeReason, previousSessionFile?: string): void {
+		const event: AgentSessionRuntimeSessionChangeEvent = {
+			reason,
+			session: this._session,
+			services: this._services,
+			previousSessionFile,
+		};
+		for (const listener of this._sessionChangeListeners) {
+			listener(event);
+		}
+	}
+
+	subscribeSessionChanges(
+		listener: AgentSessionRuntimeSessionChangeListener,
+		options?: { emitCurrent?: boolean },
+	): () => void {
+		this._sessionChangeListeners.add(listener);
+		if (options?.emitCurrent) {
+			listener({
+				reason: "current",
+				session: this._session,
+				services: this._services,
+			});
+		}
+		return () => {
+			this._sessionChangeListeners.delete(listener);
+		};
+	}
+
 	async switchSession(sessionPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		if (beforeResult.cancelled) {
@@ -161,6 +203,7 @@ export class AgentSessionRuntime {
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 			}),
 		);
+		this._emitSessionChange("resume", previousSessionFile);
 		return { cancelled: false };
 	}
 
@@ -193,6 +236,7 @@ export class AgentSessionRuntime {
 			await options.setup(this.session.sessionManager);
 			this.session.agent.state.messages = this.session.sessionManager.buildSessionContext().messages;
 		}
+		this._emitSessionChange("new", previousSessionFile);
 		return { cancelled: false };
 	}
 
@@ -242,6 +286,7 @@ export class AgentSessionRuntime {
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 					}),
 				);
+				this._emitSessionChange("fork", previousSessionFile);
 				return { cancelled: false, selectedText };
 			}
 
@@ -260,6 +305,7 @@ export class AgentSessionRuntime {
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 				}),
 			);
+			this._emitSessionChange("fork", previousSessionFile);
 			return { cancelled: false, selectedText };
 		}
 
@@ -278,6 +324,7 @@ export class AgentSessionRuntime {
 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 			}),
 		);
+		this._emitSessionChange("fork", previousSessionFile);
 		return { cancelled: false, selectedText };
 	}
 
@@ -321,6 +368,7 @@ export class AgentSessionRuntime {
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 			}),
 		);
+		this._emitSessionChange("import", previousSessionFile);
 		return { cancelled: false };
 	}
 
