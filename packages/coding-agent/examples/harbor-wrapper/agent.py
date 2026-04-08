@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import time
 from pathlib import Path
 
@@ -52,6 +53,7 @@ _REMOTE_AUTH = f"{_REMOTE_PI_DIR}/auth.json"
 _REMOTE_EXT_DIR = f"{_REMOTE_PI_DIR}/extensions"
 _REMOTE_EXT = f"{_REMOTE_EXT_DIR}/terminal-bench.ts"
 _REMOTE_TASK = "/tmp/pi-task.txt"
+_REMOTE_STDOUT = "/tmp/pi-stdout.log"
 _REMOTE_ERRORS = "/tmp/pi-errors.log"
 _REMOTE_WORKDIR = "/app"
 _REMOTE_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR"
@@ -261,8 +263,14 @@ class PiAgent(BaseAgent):
         # @file passes file content as the prompt
         cmd_parts.append(f"@{_REMOTE_TASK}")
 
-        # Redirect stderr to file for debugging
-        cmd = " ".join(cmd_parts) + f" 2>{_REMOTE_ERRORS}"
+        pi_command = " ".join(cmd_parts)
+        capture_command = (
+            "set -o pipefail; "
+            f"{pi_command} "
+            f"> >(tee {shlex.quote(_REMOTE_STDOUT)} >/dev/null) "
+            f"2> >(tee {shlex.quote(_REMOTE_ERRORS)} >/dev/null)"
+        )
+        cmd = f"bash -lc {shlex.quote(capture_command)}"
 
         remote_cwd = _REMOTE_WORKDIR if await environment.is_dir(_REMOTE_WORKDIR) else None
         if remote_cwd:
@@ -270,31 +278,51 @@ class PiAgent(BaseAgent):
         else:
             _LOGGER.warning("Working directory %s not found; using container default", _REMOTE_WORKDIR)
 
-        _LOGGER.info("Executing: %s", cmd)
+        _LOGGER.info("Executing: %s", pi_command)
 
-        result = await environment.exec(
-            cmd,
-            cwd=remote_cwd,
-            env=env_vars,
-            timeout_sec=TASK_TIMEOUT_SEC,
-        )
-
-        # Log result
-        exit_code = result.return_code
-        stdout_preview = (result.stdout or "")[:500]
-        _LOGGER.info("pi exited with code %s", exit_code)
-        if stdout_preview:
-            _LOGGER.info("pi output (first 500 chars): %s", stdout_preview)
-
-        # Download error log for debugging
+        result = None
+        exec_error: Exception | None = None
         try:
-            local_errors = self.logs_dir / "pi-errors.log"
+            result = await environment.exec(
+                cmd,
+                cwd=remote_cwd,
+                env=env_vars,
+                timeout_sec=TASK_TIMEOUT_SEC,
+            )
+        except Exception as error:
+            exec_error = error
+
+        # Always download stdout/stderr logs, even on timeout.
+        local_stdout = self.logs_dir / "pi-stdout.log"
+        local_errors = self.logs_dir / "pi-errors.log"
+        try:
+            await environment.download_file(_REMOTE_STDOUT, str(local_stdout))
+        except Exception:
+            _LOGGER.debug("Could not download pi stdout log", exc_info=True)
+        try:
             await environment.download_file(_REMOTE_ERRORS, str(local_errors))
+        except Exception:
+            _LOGGER.debug("Could not download pi error log", exc_info=True)
+
+        if local_stdout.exists():
+            stdout_content = local_stdout.read_text(errors="replace").strip()
+            if stdout_content:
+                _LOGGER.info("pi stdout (first 500 chars): %s", stdout_content[:500])
+                _LOGGER.info("pi stdout (last 500 chars): %s", stdout_content[-500:])
+
+        if local_errors.exists():
             error_content = local_errors.read_text(errors="replace").strip()
             if error_content:
                 _LOGGER.info("pi stderr (last 500 chars): %s", error_content[-500:])
-        except Exception:
-            _LOGGER.debug("Could not download pi error log", exc_info=True)
+
+        if exec_error is not None:
+            raise exec_error
+
+        assert result is not None
+
+        # Log result
+        exit_code = result.return_code
+        _LOGGER.info("pi exited with code %s", exit_code)
 
         if exit_code != 0:
             _LOGGER.error("pi failed with exit code %s", exit_code)
