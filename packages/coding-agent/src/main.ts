@@ -60,6 +60,7 @@ import { assertValidSessionId, SessionManager } from "./core/session-manager.ts"
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
+import { JsonlTraceLogger } from "./core/trace-jsonl.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { loadMcpCommand } from "./extensions/mcp/cli.lazy.ts";
@@ -924,6 +925,24 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
+	const traceJsonlPath = parsed.traceJsonl ?? process.env.PI_TRACE_JSONL;
+	let traceLogger: JsonlTraceLogger | undefined;
+	if (traceJsonlPath) {
+		try {
+			traceLogger = new JsonlTraceLogger(resolve(cwd, traceJsonlPath), {
+				cwd,
+				mode: appMode,
+				pid: process.pid,
+				version: VERSION,
+			});
+			traceLogger.attach(runtime);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(chalk.red(`Error: Failed to initialize trace log: ${message}`));
+			process.exit(1);
+		}
+	}
+
 	if (appMode !== "interactive" && !session.model) {
 		console.error(chalk.red(formatNoModelsAvailableMessage()));
 		process.exit(1);
@@ -947,7 +966,11 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (appMode === "rpc") {
 		printTimings();
-		await runRpcMode(runtime);
+		try {
+			await runRpcMode(runtime);
+		} finally {
+			traceLogger?.dispose();
+		}
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
@@ -968,6 +991,7 @@ export async function main(args: string[], options?: MainOptions) {
 			// (Kitty keyboard protocol, device attributes, cell size) before restoring the terminal.
 			await new Promise((resolve) => setTimeout(resolve, 150));
 			interactiveMode.stop();
+			traceLogger?.dispose();
 			stopThemeWatcher();
 			printTimings();
 			if (process.stdout.writableLength > 0) {
@@ -980,20 +1004,28 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 
 		printTimings();
-		await interactiveMode.run();
+		try {
+			await interactiveMode.run();
+		} finally {
+			traceLogger?.dispose();
+		}
 	} else {
 		printTimings();
-		const exitCode = await runPrintMode(runtime, {
-			mode: toPrintOutputMode(appMode),
-			messages: parsed.messages,
-			initialMessage,
-			initialImages,
-		});
-		stopThemeWatcher();
-		restoreStdout();
-		if (exitCode !== 0) {
-			process.exitCode = exitCode;
+		try {
+			const exitCode = await runPrintMode(runtime, {
+				mode: toPrintOutputMode(appMode),
+				messages: parsed.messages,
+				initialMessage,
+				initialImages,
+			});
+			stopThemeWatcher();
+			restoreStdout();
+			if (exitCode !== 0) {
+				process.exitCode = exitCode;
+			}
+			return;
+		} finally {
+			traceLogger?.dispose();
 		}
-		return;
 	}
 }
