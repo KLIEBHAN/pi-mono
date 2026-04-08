@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 from harbor.agents.base import BaseAgent
@@ -52,6 +53,8 @@ _REMOTE_EXT_DIR = f"{_REMOTE_PI_DIR}/extensions"
 _REMOTE_EXT = f"{_REMOTE_EXT_DIR}/terminal-bench.ts"
 _REMOTE_TASK = "/tmp/pi-task.txt"
 _REMOTE_ERRORS = "/tmp/pi-errors.log"
+_REMOTE_WORKDIR = "/app"
+_REMOTE_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR"
 
 
 def _find_extension() -> Path | None:
@@ -72,6 +75,51 @@ def _parse_model_arg(model_name: str | None) -> tuple[str | None, str | None]:
     return None, model_name
 
 
+def _read_host_auth() -> dict[str, object] | None:
+    """Load host auth.json if present and valid."""
+    if not _HOST_AUTH.exists():
+        return None
+
+    try:
+        data = json.loads(_HOST_AUTH.read_text())
+    except Exception:
+        _LOGGER.warning("Failed to parse %s", _HOST_AUTH, exc_info=True)
+        return None
+
+    if not isinstance(data, dict):
+        _LOGGER.warning("Ignoring non-object auth.json at %s", _HOST_AUTH)
+        return None
+
+    return data
+
+
+def _get_oauth_access_token(auth_data: dict[str, object] | None, provider: str) -> str | None:
+    """Extract a non-expired OAuth access token from auth.json."""
+    if not auth_data:
+        return None
+
+    entry = auth_data.get(provider)
+    if not isinstance(entry, dict):
+        return None
+
+    if entry.get("type") != "oauth":
+        return None
+
+    access = entry.get("access")
+    if not isinstance(access, str) or not access:
+        return None
+
+    expires = entry.get("expires")
+    if isinstance(expires, (int, float)) and expires <= time.time() * 1000:
+        _LOGGER.warning(
+            "%s OAuth access token in auth.json is expired; relying on uploaded auth.json instead",
+            provider,
+        )
+        return None
+
+    return access
+
+
 class PiAgent(BaseAgent):
     """Harbor agent that installs and runs pi inside the sandbox container."""
 
@@ -80,6 +128,8 @@ class PiAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._provider, self._model_id = _parse_model_arg(self.model_name)
+        self._host_auth = _read_host_auth()
+        self._anthropic_oauth_token = _get_oauth_access_token(self._host_auth, "anthropic")
 
     @staticmethod
     def name() -> str:
@@ -142,11 +192,16 @@ class PiAgent(BaseAgent):
             _LOGGER.info("Uploading auth.json for subscription auth")
             await environment.exec(f"mkdir -p {_REMOTE_PI_DIR}", timeout_sec=5)
             await environment.upload_file(str(_HOST_AUTH), _REMOTE_AUTH)
+
+            if self._anthropic_oauth_token:
+                _LOGGER.info("Will inject Anthropic OAuth access token via environment")
+        elif os.environ.get("ANTHROPIC_OAUTH_TOKEN"):
+            _LOGGER.info("Using ANTHROPIC_OAUTH_TOKEN from environment")
         elif os.environ.get("ANTHROPIC_API_KEY"):
             _LOGGER.info("Using ANTHROPIC_API_KEY from environment")
         else:
             _LOGGER.warning(
-                "No auth.json and no ANTHROPIC_API_KEY. "
+                "No auth.json, ANTHROPIC_OAUTH_TOKEN, or ANTHROPIC_API_KEY. "
                 "Pi may not be able to authenticate."
             )
 
@@ -181,9 +236,12 @@ class PiAgent(BaseAgent):
         if self._model_id:
             cmd_parts.extend(["--model", self._model_id])
 
-        # Pass API key as env var if set on host
-        env_vars: dict[str, str] = {}
+        # Pass auth + config via env vars.
+        env_vars: dict[str, str] = {
+            _REMOTE_AGENT_DIR_ENV: _REMOTE_PI_DIR,
+        }
         for key in [
+            "ANTHROPIC_OAUTH_TOKEN",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
@@ -193,17 +251,31 @@ class PiAgent(BaseAgent):
             if val:
                 env_vars[key] = val
 
+        if (
+            "ANTHROPIC_OAUTH_TOKEN" not in env_vars
+            and "ANTHROPIC_API_KEY" not in env_vars
+            and self._anthropic_oauth_token
+        ):
+            env_vars["ANTHROPIC_OAUTH_TOKEN"] = self._anthropic_oauth_token
+
         # @file passes file content as the prompt
         cmd_parts.append(f"@{_REMOTE_TASK}")
 
         # Redirect stderr to file for debugging
         cmd = " ".join(cmd_parts) + f" 2>{_REMOTE_ERRORS}"
 
+        remote_cwd = _REMOTE_WORKDIR if await environment.is_dir(_REMOTE_WORKDIR) else None
+        if remote_cwd:
+            _LOGGER.info("Executing in working directory: %s", remote_cwd)
+        else:
+            _LOGGER.warning("Working directory %s not found; using container default", _REMOTE_WORKDIR)
+
         _LOGGER.info("Executing: %s", cmd)
 
         result = await environment.exec(
             cmd,
-            env=env_vars if env_vars else None,
+            cwd=remote_cwd,
+            env=env_vars,
             timeout_sec=TASK_TIMEOUT_SEC,
         )
 
