@@ -40,6 +40,8 @@ import {
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
+import { allTools } from "./core/tools/index.js";
+import { JsonlTraceLogger } from "./core/trace-jsonl.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
@@ -663,6 +665,24 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
+	const traceJsonlPath = parsed.traceJsonl ?? process.env.PI_TRACE_JSONL;
+	let traceLogger: JsonlTraceLogger | undefined;
+	if (traceJsonlPath) {
+		try {
+			traceLogger = new JsonlTraceLogger(resolve(cwd, traceJsonlPath), {
+				cwd,
+				mode: appMode,
+				pid: process.pid,
+				version: VERSION,
+			});
+			traceLogger.attach(runtime);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(chalk.red(`Error: Failed to initialize trace log: ${message}`));
+			process.exit(1);
+		}
+	}
+
 	if (appMode !== "interactive" && !session.model) {
 		console.error(chalk.red(formatNoModelsAvailableMessage()));
 		process.exit(1);
@@ -676,7 +696,11 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (appMode === "rpc") {
 		printTimings();
-		await runRpcMode(runtime);
+		try {
+			await runRpcMode(runtime);
+		} finally {
+			traceLogger?.dispose();
+		}
 	} else if (appMode === "interactive") {
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
 			const modelList = scopedModels
@@ -701,6 +725,7 @@ export async function main(args: string[], options?: MainOptions) {
 			time("interactiveMode.init");
 			printTimings();
 			interactiveMode.stop();
+			traceLogger?.dispose();
 			stopThemeWatcher();
 			if (process.stdout.writableLength > 0) {
 				await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
@@ -712,20 +737,28 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 
 		printTimings();
-		await interactiveMode.run();
+		try {
+			await interactiveMode.run();
+		} finally {
+			traceLogger?.dispose();
+		}
 	} else {
 		printTimings();
-		const exitCode = await runPrintMode(runtime, {
-			mode: toPrintOutputMode(appMode),
-			messages: parsed.messages,
-			initialMessage,
-			initialImages,
-		});
-		stopThemeWatcher();
-		restoreStdout();
-		if (exitCode !== 0) {
-			process.exitCode = exitCode;
+		try {
+			const exitCode = await runPrintMode(runtime, {
+				mode: toPrintOutputMode(appMode),
+				messages: parsed.messages,
+				initialMessage,
+				initialImages,
+			});
+			stopThemeWatcher();
+			restoreStdout();
+			if (exitCode !== 0) {
+				process.exitCode = exitCode;
+			}
+			return;
+		} finally {
+			traceLogger?.dispose();
 		}
-		return;
 	}
 }
