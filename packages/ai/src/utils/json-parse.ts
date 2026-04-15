@@ -2,6 +2,12 @@ import { parse as partialParse } from "partial-json";
 
 const VALID_JSON_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
 
+type JsonObject = Record<string, unknown>;
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function isControlCharacter(char: string): boolean {
 	const codePoint = char.codePointAt(0);
 	return codePoint !== undefined && codePoint >= 0x00 && codePoint <= 0x1f;
@@ -150,7 +156,7 @@ function sanitizeJsonControlChars(json: string): string {
 						result += "\\r";
 						break;
 					default:
-						result += "\\u" + code.toString(16).padStart(4, "0");
+						result += `\\u${code.toString(16).padStart(4, "0")}`;
 						break;
 				}
 				continue;
@@ -175,27 +181,39 @@ function sanitizeJsonControlChars(json: string): string {
  * @param partialJson The partial JSON string from streaming
  * @returns Parsed object or empty object if parsing fails
  */
-export function parseStreamingJson<T = Record<string, unknown>>(partialJson: string | undefined): T {
+export function parseStreamingJson<T extends JsonObject = JsonObject>(partialJson: string | undefined): T {
 	if (!partialJson || partialJson.trim() === "") {
 		return {} as T;
 	}
 
+	const parseObject = (json: string): T => {
+		const parsed = parseJsonWithRepair<unknown>(json);
+		return (isJsonObject(parsed) ? parsed : {}) as T;
+	};
+
 	try {
-		return parseJsonWithRepair<T>(partialJson);
+		return parseObject(partialJson);
 	} catch {
 		// Sanitize raw control characters inside string literals before retrying.
 		// LLMs sometimes emit real newlines/tabs instead of \n/\t in tool-call
 		// argument JSON strings (e.g. multi-line code in edit oldText/newText).
 		const sanitized = sanitizeJsonControlChars(partialJson);
+		if (sanitized !== partialJson) {
+			try {
+				return parseObject(sanitized);
+			} catch {
+				// fall through to partial-json
+			}
+		}
 
 		// Try partial-json for incomplete JSON.
 		try {
 			const result = partialParse(sanitized);
-			return (result ?? {}) as T;
+			return (isJsonObject(result) ? result : {}) as T;
 		} catch {
 			try {
 				const result = partialParse(repairJson(partialJson));
-				return (result ?? {}) as T;
+				return (isJsonObject(result) ? result : {}) as T;
 			} catch {
 				return {} as T;
 			}
