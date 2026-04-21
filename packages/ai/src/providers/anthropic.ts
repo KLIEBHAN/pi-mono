@@ -216,6 +216,17 @@ export interface AnthropicOptions extends StreamOptions {
 	client?: Anthropic;
 }
 
+type AnthropicThinkingConfigWithDisplay =
+	| { type: "adaptive"; display: AnthropicThinkingDisplay }
+	| { type: "enabled"; budget_tokens: number; display: AnthropicThinkingDisplay };
+
+function toAnthropicThinkingConfig(
+	config: AnthropicThinkingConfigWithDisplay,
+): NonNullable<MessageCreateParamsStreaming["thinking"]> {
+	// The Anthropic SDK types can lag newly supported thinking fields such as `display`.
+	return config as unknown as NonNullable<MessageCreateParamsStreaming["thinking"]>;
+}
+
 function mergeHeaders(...headerSources: (Record<string, string | null> | undefined)[]): Record<string, string | null> {
 	const merged: Record<string, string | null> = {};
 	for (const headers of headerSources) {
@@ -929,7 +940,7 @@ function buildParams(
 			const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";
 			if (supportsAdaptiveThinking(model.id)) {
 				// Adaptive thinking: Claude decides when and how much to think.
-				params.thinking = { type: "adaptive", display };
+				params.thinking = toAnthropicThinkingConfig({ type: "adaptive", display });
 				if (options.effort) {
 					// The Anthropic SDK types can lag newly supported effort values such as "xhigh".
 					params.output_config =
@@ -941,11 +952,11 @@ function buildParams(
 				}
 			} else {
 				// Budget-based thinking for older models
-				params.thinking = {
+				params.thinking = toAnthropicThinkingConfig({
 					type: "enabled",
 					budget_tokens: options.thinkingBudgetTokens || 1024,
 					display,
-				};
+				});
 			}
 		} else if (options?.thinkingEnabled === false) {
 			params.thinking = { type: "disabled" };
