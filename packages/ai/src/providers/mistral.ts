@@ -1,11 +1,11 @@
 import { Mistral } from "@mistralai/mistralai";
 import type {
 	ChatCompletionStreamRequest,
-	ChatCompletionStreamRequestMessage,
-	CompletionEvent,
-	ContentChunk,
-	FunctionTool,
-} from "@mistralai/mistralai/models/components";
+	ChatCompletionStreamRequestMessages,
+} from "@mistralai/mistralai/models/components/chatcompletionstreamrequest.js";
+import type { CompletionEvent } from "@mistralai/mistralai/models/components/completionevent.js";
+import type { ContentChunk } from "@mistralai/mistralai/models/components/contentchunk.js";
+import type { FunctionTool } from "@mistralai/mistralai/models/components/functiontool.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost } from "../models.js";
 import type {
@@ -36,6 +36,10 @@ const MAX_MISTRAL_ERROR_BODY_CHARS = 4000;
  * Provider-specific options for the Mistral API.
  */
 type MistralReasoningEffort = "none" | "high";
+type ChatCompletionStreamRequestMessage = ChatCompletionStreamRequestMessages;
+type MistralChatCompletionStreamRequest = ChatCompletionStreamRequest & {
+	reasoningEffort?: MistralReasoningEffort;
+};
 
 export interface MistralOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "any" | "required" | { type: "function"; function: { name: string } };
@@ -74,7 +78,7 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 			let payload = buildChatPayload(model, context, transformedMessages, options);
 			const nextPayload = await options?.onPayload?.(payload, model);
 			if (nextPayload !== undefined) {
-				payload = nextPayload as ChatCompletionStreamRequest;
+				payload = nextPayload as MistralChatCompletionStreamRequest;
 			}
 			const mistralStream = await mistral.chat.stream(payload, buildRequestOptions(model, options));
 			stream.push({ type: "start", partial: output });
@@ -241,8 +245,8 @@ function buildChatPayload(
 	context: Context,
 	messages: Message[],
 	options?: MistralOptions,
-): ChatCompletionStreamRequest {
-	const payload: ChatCompletionStreamRequest = {
+): MistralChatCompletionStreamRequest {
+	const payload: MistralChatCompletionStreamRequest = {
 		model: model.id,
 		stream: true,
 		messages: toChatMessages(messages, model.input.includes("image")),
@@ -603,7 +607,7 @@ function mapToolChoice(
 ): "auto" | "none" | "any" | "required" | { type: "function"; function: { name: string } } | undefined {
 	if (!choice) return undefined;
 	if (choice === "auto" || choice === "none" || choice === "any" || choice === "required") {
-		return choice as any;
+		return choice;
 	}
 	return {
 		type: "function",
