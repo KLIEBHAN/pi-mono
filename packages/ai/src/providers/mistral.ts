@@ -1,7 +1,7 @@
 import { Mistral } from "@mistralai/mistralai";
 import type {
 	ChatCompletionStreamRequest,
-	ChatCompletionStreamRequestMessages,
+	ChatCompletionStreamRequestMessage,
 } from "@mistralai/mistralai/models/components/chatcompletionstreamrequest.js";
 import type { CompletionEvent } from "@mistralai/mistralai/models/components/completionevent.js";
 import type { ContentChunk } from "@mistralai/mistralai/models/components/contentchunk.js";
@@ -36,7 +36,6 @@ const MAX_MISTRAL_ERROR_BODY_CHARS = 4000;
  * Provider-specific options for the Mistral API.
  */
 type MistralReasoningEffort = "none" | "high";
-type ChatCompletionStreamRequestMessage = ChatCompletionStreamRequestMessages;
 type MistralChatCompletionStreamRequest = ChatCompletionStreamRequest & {
 	reasoningEffort?: MistralReasoningEffort;
 };
