@@ -28,6 +28,7 @@ coverage/
 tui-debug.log
 compaction-results/
 .opencode/
+.omx/
 syntax.jsonl
 out.jsonl
 pi-*.html
