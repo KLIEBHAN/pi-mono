@@ -1,11 +1,11 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { AgentSessionEvent } from "./agent-session.js";
+import type { AgentSessionEvent } from "./agent-session.ts";
 import type {
 	AgentSessionRuntime,
 	AgentSessionRuntimeSessionChangeEvent,
 	AgentSessionRuntimeSessionChangeListener,
-} from "./agent-session-runtime.js";
+} from "./agent-session-runtime.ts";
 
 const TRACE_VERSION = 1;
 const MAX_TRACE_DEPTH = 8;
@@ -155,12 +155,13 @@ function eventTypeOf(event: AgentSessionEvent): string {
 }
 
 export class JsonlTraceLogger {
+	private readonly filePath: string;
 	private unsubscribeRuntime: (() => void) | undefined;
 	private unsubscribeSession: (() => void) | undefined;
 	private disabled = false;
 
 	constructor(
-		private readonly filePath: string,
+		filePath: string,
 		metadata: {
 			cwd: string;
 			mode: "interactive" | "print" | "json" | "rpc";
@@ -168,6 +169,7 @@ export class JsonlTraceLogger {
 			version: string;
 		},
 	) {
+		this.filePath = filePath;
 		mkdirSync(dirname(filePath), { recursive: true });
 		this.writeRecord({
 			type: "trace_start",
