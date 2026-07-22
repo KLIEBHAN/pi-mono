@@ -33,10 +33,13 @@ tui-debug.log
 compaction-results/
 .opencode/
 .omx/
+.pi/
+.pi-subagents/
 syntax.jsonl
 out.jsonl
 pi-*.html
 out.html
+architecture.html
 packages/coding-agent/binaries/
 todo.md
 plans/
